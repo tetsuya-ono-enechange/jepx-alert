@@ -7,15 +7,17 @@ from playwright.async_api import async_playwright
 
 # --- 設定項目 ---
 LINE_TOKEN = os.environ.get("LINE_TOKEN")
-USER_ID = os.environ.get("LINE_USER_ID")
+# ※全員に送るため、USER_IDの取得は不要になりました
 PRICE_LIMIT = 15.0       # コマ数をカウントする基準（15円以下）
 SUPER_CHEAP_LIMIT = 5.0  # 時間帯をすべて表示する基準（5円以下）
 # --------------
 
 def send_line_message(text):
-    url = "https://api.line.me/v2/bot/message/push"
+    # ★変更点1：送信先URLを「broadcast（全員一斉送信）」に変更
+    url = "https://api.line.me/v2/bot/message/broadcast"
     headers = {"Authorization": f"Bearer {LINE_TOKEN}"}
-    payload = {"to": USER_ID, "messages": [{"type": "text", "text": text}]}
+    # ★変更点2：宛先（to）の指定を削除
+    payload = {"messages": [{"type": "text", "text": text}]}
     requests.post(url, headers=headers, json=payload)
 
 async def main_logic():
@@ -119,7 +121,7 @@ async def main_logic():
         # 2. 15円以下のコマ数
         cheap_count = len(df_target[df_target[target_area] <= PRICE_LIMIT])
 
-        # 3. ★新規追加：5円以下の時間帯をすべてリストアップ
+        # 3. 5円以下の時間帯をすべてリストアップ
         super_cheap_slots = df_target[df_target[target_area] <= SUPER_CHEAP_LIMIT]
         super_cheap_times = []
         for _, row in super_cheap_slots.iterrows():
@@ -128,10 +130,9 @@ async def main_logic():
             m = "30" if tc % 2 == 0 else "00"
             super_cheap_times.append(f"{h:02d}:{m}")
         
-        # リストをカンマ区切りの文字列にする（空なら「なし」）
         super_cheap_str = "、".join(super_cheap_times) if super_cheap_times else "なし"
 
-        # 4. 日中(8:00-18:00 = 時刻コード17〜36) と 夜間(それ以外) の平均を計算
+        # 4. 日中(8:00-18:00) と 夜間(それ以外) の平均を計算
         daytime_mask = (df_target['時刻コード'] >= 17) & (df_target['時刻コード'] <= 36)
         daytime_avg = round(df_target.loc[daytime_mask, target_area].mean(), 2)
         nighttime_avg = round(df_target.loc[~daytime_mask, target_area].mean(), 2)
