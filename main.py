@@ -19,63 +19,62 @@ def send_line_message(text):
     requests.post(url, headers=headers, json=payload)
 
 async def main_logic():
-    send_line_message("【最終突破モード起動】\n画面サイズを最大化し、強制クリックを実行します...")
+    send_line_message("【最終チェック】\nファイルの保存処理を修正し、解析を実行します...")
     
     now = datetime.now()
     tomorrow = now + timedelta(days=1)
-    file_path = ""
+    
+    # 【対策】消されないように保存先ファイル名を明確に指定
+    saved_file_path = "jepx_spot.csv"
     
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
-            
-            # 【対策1】画面サイズをフルHD（1920x1080）に巨大化して枠外エラーを防ぐ
             page = await browser.new_page(viewport={"width": 1920, "height": 1080})
             page.set_default_timeout(45000)
             
             await page.goto("https://www.jepx.jp/electricpower/market-data/spot/")
             await page.wait_for_load_state("networkidle")
-            await page.wait_for_timeout(5000) # 描画待機
+            await page.wait_for_timeout(5000)
 
-            # 手順1: 1回目の「データダウンロード」ボタンを強制クリック
+            # 手順1: 1回目のボタン強制クリック
             try:
-                # 診断結果から判明した <button> タグを正確に狙う
                 dl_button_1 = page.locator('button:has-text("データダウンロード")').first
-                # 【対策2】Playwrightのクリックではなく、ブラウザ内部のJavaScriptを直接発火させる（最強のクリック）
                 await dl_button_1.evaluate("node => node.click()")
             except Exception as e:
                 send_line_message(f"【エラー】1回目のボタンが押せませんでした。\n詳細: {e}")
                 await browser.close()
                 return
 
-            await page.wait_for_timeout(2000) # モーダルの出現を待つ
+            await page.wait_for_timeout(2000)
 
-            # 手順2: モーダル内の2回目のボタンを強制クリックしてダウンロード
+            # 手順2: 2回目のボタン強制クリック
             try:
-                # 画面上に複数あるボタンのうち、一番最後（手前に出たモーダル内）を狙う
                 dl_button_2 = page.locator('button:has-text("データダウンロード")').last
-                
                 async with page.expect_download(timeout=45000) as download_info:
-                    # これもJavaScriptで直接発火させる
                     await dl_button_2.evaluate("node => node.click()")
                     
                 download = await download_info.value
-                file_path = await download.path()
+                
+                # 【ここが最重要の修正点】ブラウザを閉じる前に、安全な場所に保存する！
+                await download.save_as(saved_file_path)
+                
             except Exception as e:
                 send_line_message(f"【エラー】2回目のボタン(CSV保存)が押せませんでした。\n詳細: {e}")
                 await browser.close()
                 return
                 
             await browser.close()
-            send_line_message("【報告】CSVデータのダウンロードに成功しました！解析に移行します。")
+            send_line_message("【報告】CSVデータの確実な保存に成功しました！解析に移行します。")
             
     except Exception as e:
-        send_line_message(f"【致命的エラー】Playwrightの操作中に予期せぬエラーが発生しました。\n詳細: {e}")
+        send_line_message(f"【致命的エラー】Playwrightの操作中にエラーが発生しました。\n詳細: {e}")
         return
 
     # --- CSV解析 ---
     try:
-        df = pd.read_csv(file_path, encoding="shift_jis")
+        # さきほど保存したファイルを読み込む
+        df = pd.read_csv(saved_file_path, encoding="shift_jis")
         
         if TARGET_AREA not in df.columns:
             send_line_message(f"【エラー】エリア名「{TARGET_AREA}」がCSV内に見つかりません。")
@@ -119,6 +118,3 @@ async def main_logic():
             
     except Exception as e:
         send_line_message(f"【エラー】CSV解析中にエラーが発生しました。\n詳細: {e}")
-
-if __name__ == "__main__":
-    asyncio.run(main_logic())
