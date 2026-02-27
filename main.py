@@ -8,7 +8,6 @@ from playwright.async_api import async_playwright
 # --- 設定項目 ---
 LINE_TOKEN = os.environ.get("LINE_TOKEN")
 USER_ID = os.environ.get("LINE_USER_ID")
-TARGET_AREA = "エリアプライス東京(円/kWh)" # お住まいのエリア
 PRICE_LIMIT = 15.0
 # --------------
 
@@ -19,12 +18,10 @@ def send_line_message(text):
     requests.post(url, headers=headers, json=payload)
 
 async def main_logic():
-    send_line_message("【最終チェック】\nファイルの保存処理を修正し、解析を実行します...")
+    send_line_message("【解析フェーズ】\nファイルの保存完了。データ解析を開始します...")
     
     now = datetime.now()
     tomorrow = now + timedelta(days=1)
-    
-    # 【対策】消されないように保存先ファイル名を明確に指定
     saved_file_path = "jepx_spot.csv"
     
     try:
@@ -48,15 +45,13 @@ async def main_logic():
 
             await page.wait_for_timeout(2000)
 
-            # 手順2: 2回目のボタン強制クリック
+            # 手順2: 2回目のボタン強制クリックと保存
             try:
                 dl_button_2 = page.locator('button:has-text("データダウンロード")').last
                 async with page.expect_download(timeout=45000) as download_info:
                     await dl_button_2.evaluate("node => node.click()")
                     
                 download = await download_info.value
-                
-                # 【ここが最重要の修正点】ブラウザを閉じる前に、安全な場所に保存する！
                 await download.save_as(saved_file_path)
                 
             except Exception as e:
@@ -65,7 +60,6 @@ async def main_logic():
                 return
                 
             await browser.close()
-            send_line_message("【報告】CSVデータの確実な保存に成功しました！解析に移行します。")
             
     except Exception as e:
         send_line_message(f"【致命的エラー】Playwrightの操作中にエラーが発生しました。\n詳細: {e}")
@@ -73,14 +67,26 @@ async def main_logic():
 
     # --- CSV解析 ---
     try:
-        # さきほど保存したファイルを読み込む
         df = pd.read_csv(saved_file_path, encoding="shift_jis")
         
-        if TARGET_AREA not in df.columns:
-            send_line_message(f"【エラー】エリア名「{TARGET_AREA}」がCSV内に見つかりません。")
+        # 【★超重要追加】列名を自動で探す処理
+        columns = df.columns.tolist()
+        target_area = None
+        
+        # 「東京」と「プライス」が含まれる列を探す
+        for col in columns:
+            if "東京" in col and "プライス" in col:
+                target_area = col
+                break
+                
+        # もし見つからなければ、実際の列名をLINEに送る（デバッグ用）
+        if target_area is None:
+            cols_str = "\n".join(columns[:15]) # 最初の15列だけ抽出
+            send_line_message(f"【列名エラー】\nCSV内に「東京」の列が見つかりません。\n\n▼実際の列名一覧▼\n{cols_str}")
             return
             
-        df = df.dropna(subset=["受渡日", TARGET_AREA])
+        # 見つかった正しい列名をセット
+        df = df.dropna(subset=["受渡日", target_area])
         
         tomorrow_str_padded = tomorrow.strftime("%Y/%m/%d")
         tomorrow_str_unpadded = f"{tomorrow.year}/{tomorrow.month}/{tomorrow.day}"
@@ -98,19 +104,19 @@ async def main_logic():
                 send_line_message("【エラー】解析可能なデータ（今日・明日）が見つかりませんでした。")
                 return
 
-        cheap_slots = df_target[df_target[TARGET_AREA] <= PRICE_LIMIT]
+        cheap_slots = df_target[df_target[target_area] <= PRICE_LIMIT]
         
         if cheap_slots.empty:
             send_line_message(f"【結果報告】\n{target_date_str}は{PRICE_LIMIT}円以下の時間がありませんでした。\n(充電見送り推奨)")
         else:
-            min_row = cheap_slots.loc[cheap_slots[TARGET_AREA].idxmin()]
+            min_row = cheap_slots.loc[cheap_slots[target_area].idxmin()]
             time_code = int(min_row['時刻コード'])
             hour = (time_code - 1) // 2
             minute = "30" if time_code % 2 == 0 else "00"
             
             message = (
                 f"【{target_date_str}の充電推奨】\n"
-                f"最安値: {min_row[TARGET_AREA]}円\n"
+                f"最安値: {min_row[target_area]}円\n"
                 f"時間帯: {hour:02d}:{minute}〜\n"
                 f"※15円以下は計 {len(cheap_slots)} コマ"
             )
