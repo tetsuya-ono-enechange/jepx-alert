@@ -18,7 +18,7 @@ def send_line_message(text):
     requests.post(url, headers=headers, json=payload)
 
 async def main_logic():
-    send_line_message("【解析フェーズ】\nファイルの保存完了。データ解析を開始します...")
+    send_line_message("【最終調整】\n本物のCSVファイル（30分コマデータ）を厳密に指定して取得します...")
     
     now = datetime.now()
     tomorrow = now + timedelta(days=1)
@@ -34,10 +34,12 @@ async def main_logic():
             await page.wait_for_load_state("networkidle")
             await page.wait_for_timeout(5000)
 
+            # 【★最大の修正点】「インデックス」ボタンを除外するため、exact=True（完全一致）で指定
+            target_buttons = page.get_by_text("データダウンロード", exact=True)
+
             # 手順1: 1回目のボタン強制クリック
             try:
-                dl_button_1 = page.locator('button:has-text("データダウンロード")').first
-                await dl_button_1.evaluate("node => node.click()")
+                await target_buttons.first.evaluate("node => node.click()")
             except Exception as e:
                 send_line_message(f"【エラー】1回目のボタンが押せませんでした。\n詳細: {e}")
                 await browser.close()
@@ -47,9 +49,8 @@ async def main_logic():
 
             # 手順2: 2回目のボタン強制クリックと保存
             try:
-                dl_button_2 = page.locator('button:has-text("データダウンロード")').last
                 async with page.expect_download(timeout=45000) as download_info:
-                    await dl_button_2.evaluate("node => node.click()")
+                    await target_buttons.last.evaluate("node => node.click()")
                     
                 download = await download_info.value
                 await download.save_as(saved_file_path)
@@ -69,23 +70,19 @@ async def main_logic():
     try:
         df = pd.read_csv(saved_file_path, encoding="shift_jis")
         
-        # 【★超重要追加】列名を自動で探す処理
         columns = df.columns.tolist()
         target_area = None
         
-        # 「東京」と「プライス」が含まれる列を探す
         for col in columns:
             if "東京" in col and "プライス" in col:
                 target_area = col
                 break
                 
-        # もし見つからなければ、実際の列名をLINEに送る（デバッグ用）
         if target_area is None:
-            cols_str = "\n".join(columns[:15]) # 最初の15列だけ抽出
+            cols_str = "\n".join(columns[:15])
             send_line_message(f"【列名エラー】\nCSV内に「東京」の列が見つかりません。\n\n▼実際の列名一覧▼\n{cols_str}")
             return
             
-        # 見つかった正しい列名をセット
         df = df.dropna(subset=["受渡日", target_area])
         
         tomorrow_str_padded = tomorrow.strftime("%Y/%m/%d")
