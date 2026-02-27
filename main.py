@@ -118,3 +118,6 @@ async def main_logic():
             
     except Exception as e:
         send_line_message(f"【エラー】CSV解析中にエラーが発生しました。\n詳細: {e}")
+
+if __name__ == "__main__":
+    asyncio.run(main_logic())
