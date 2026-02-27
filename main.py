@@ -13,22 +13,20 @@ PRICE_LIMIT = 15.0
 # --------------
 
 def send_line_message(text):
-    """LINEへメッセージを送信する関数（ここはそのまま）"""
+    """LINEへメッセージを送信する関数"""
     url = "https://api.line.me/v2/bot/message/push"
     headers = {"Authorization": f"Bearer {LINE_TOKEN}"}
     payload = {"to": USER_ID, "messages": [{"type": "text", "text": text}]}
     requests.post(url, headers=headers, json=payload)
 
 async def main_logic():
-    """データ取得から解析までのメイン処理（非同期モード）"""
-    send_line_message("【開始通知】\nJEPX価格チェッカーが起動しました。\n現在、最新のデータを取得・解析中です...")
+    send_line_message("【開始通知】\nJEPX価格チェッカーが起動しました。\n最新データを取得しています...")
     
     now = datetime.now()
     tomorrow = now + timedelta(days=1)
     file_path = ""
     
     try:
-        # 非同期モード(async_playwright)でブラウザを起動
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
             page = await browser.new_page()
@@ -36,14 +34,24 @@ async def main_logic():
             await page.goto("https://www.jepx.jp/electricpower/market-data/spot/")
             await page.wait_for_load_state("networkidle")
             
-            # 手順1: 1回目の「データダウンロード」ボタンを押し、モーダルを出す
-            dl_buttons = page.locator('text="データダウンロード"')
-            await dl_buttons.first.click(force=True)
-            await page.wait_for_timeout(1500) # モーダルが開くのを待つ
+            # 【重要修正】ダミーを避け、画面に見えている本物のボタンだけを狙う
             
-            # 手順2: モーダル内にある2回目のボタンを押してCSVを受け取る
+            # 手順1: 1回目の「データダウンロード」ボタン（メイン画面のボタン）
+            # クラス名やリンク構造で明確に指定します
+            first_dl_button = page.locator('a.btn-download, a:has-text("データダウンロード")').first
+            await first_dl_button.scroll_into_view_if_needed()
+            await first_dl_button.click(force=True)
+            
+            # モーダル（ポップアップ画面）が開くのを確実に待つ
+            await page.wait_for_timeout(2000) 
+            
+            # 手順2: モーダル内にある2回目の「データダウンロード」ボタン
+            # モーダル領域（.modal, .dialog など）の中にあるボタンを狙うのが確実ですが、
+            # サイト構造が不明確な場合を考慮し、「画面上に表示されている（visible）」ボタンを狙う
+            second_dl_button = page.locator('button:has-text("データダウンロード"):visible, a:has-text("データダウンロード"):visible').last
+            
             async with page.expect_download(timeout=60000) as download_info:
-                await dl_buttons.last.click(force=True)
+                await second_dl_button.click(force=True)
                 
             download = await download_info.value
             file_path = await download.path()
@@ -53,26 +61,22 @@ async def main_logic():
         send_line_message(f"【エラー】サイトからのデータダウンロードに失敗しました。\n詳細: {e}")
         return
 
-    # --- CSV解析（ここは通常のPython処理） ---
+    # --- CSV解析 ---
     try:
         df = pd.read_csv(file_path, encoding="shift_jis")
         
-        # エリア名の列が存在するかチェック
         if TARGET_AREA not in df.columns:
             send_line_message(f"【エラー】エリア名「{TARGET_AREA}」がCSV内に見つかりません。")
             return
             
-        # 【データ整形】価格や日付が空欄（NaN）の不正な行を事前に除外
         df = df.dropna(subset=["受渡日", TARGET_AREA])
         
-        # 日付フォーマットの揺れに対応
         tomorrow_str_padded = tomorrow.strftime("%Y/%m/%d")
         tomorrow_str_unpadded = f"{tomorrow.year}/{tomorrow.month}/{tomorrow.day}"
         
         df_target = df[(df["受渡日"] == tomorrow_str_padded) | (df["受渡日"] == tomorrow_str_unpadded)]
         target_date_str = "明日"
         
-        # 明日のデータがない場合は「今日」のデータで代替
         if df_target.empty:
             today_str_padded = now.strftime("%Y/%m/%d")
             today_str_unpadded = f"{now.year}/{now.month}/{now.day}"
@@ -83,13 +87,11 @@ async def main_logic():
                 send_line_message("【エラー】解析可能なデータ（今日・明日）が見つかりませんでした。")
                 return
 
-        # 15円以下の時間帯を抽出
         cheap_slots = df_target[df_target[TARGET_AREA] <= PRICE_LIMIT]
         
         if cheap_slots.empty:
             send_line_message(f"【結果報告】\n{target_date_str}は{PRICE_LIMIT}円以下の時間がありませんでした。\n(充電見送り推奨)")
         else:
-            # 最安値を取得し、時刻コードを実時間に変換
             min_row = cheap_slots.loc[cheap_slots[TARGET_AREA].idxmin()]
             time_code = int(min_row['時刻コード'])
             hour = (time_code - 1) // 2
@@ -107,5 +109,4 @@ async def main_logic():
         send_line_message(f"【エラー】CSV解析中にエラーが発生しました。\n詳細: {e}")
 
 if __name__ == "__main__":
-    # イベントループの衝突を避けるための実行コマンド
     asyncio.run(main_logic())
