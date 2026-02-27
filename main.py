@@ -19,8 +19,29 @@ def send_line_message(text):
     payload = {"to": USER_ID, "messages": [{"type": "text", "text": text}]}
     requests.post(url, headers=headers, json=payload)
 
+async def analyze_page(page, step_name):
+    """【診断機能】画面上の「ダウンロード」という文字をすべて収集する"""
+    try:
+        elements = await page.evaluate('''() => {
+            let results = [];
+            // ボタンやリンクの中から関連しそうなものを探す
+            document.querySelectorAll('a, button, span, div').forEach(el => {
+                let txt = el.innerText || "";
+                if(txt.includes("ダウンロード") || txt.includes("CSV")) {
+                    results.push(`<${el.tagName.toLowerCase()}> ${txt.trim().substring(0, 20)}`);
+                }
+            });
+            return Array.from(new Set(results)); // 重複削除
+        }''')
+        
+        if not elements:
+            return f"[{step_name}] 画面上に「ダウンロード」という文字が一切存在しません。"
+        return f"[{step_name}] 発見された関連ボタン:\n" + "\n".join(elements[:5])
+    except Exception as e:
+        return f"[{step_name}] 診断エラー: {e}"
+
 async def main_logic():
-    send_line_message("【開始通知】\nJEPX価格チェッカーが起動しました。\n最新データを取得しています...")
+    send_line_message("【診断モード起動】\nサイトの構造を解析しながら安全に進行します...")
     
     now = datetime.now()
     tomorrow = now + timedelta(days=1)
@@ -31,34 +52,64 @@ async def main_logic():
             browser = await p.chromium.launch(headless=True)
             page = await browser.new_page()
             
+            # サイトが重い場合を考慮し、全体の待機時間を45秒に延長
+            page.set_default_timeout(45000)
+            
             await page.goto("https://www.jepx.jp/electricpower/market-data/spot/")
+            
+            # 【対策1】通信が静かになるまで待ち、さらに「強制的に5秒」待機して描画を完了させる
             await page.wait_for_load_state("networkidle")
+            await page.wait_for_timeout(5000)
             
-            # 【重要修正】ダミーを避け、画面に見えている本物のボタンだけを狙う
+            # 【対策2】サイト訪問時に「お知らせ」ポップアップ等が出ているとクリックを邪魔するため消す
+            try:
+                close_btns = page.get_by_text("閉じる")
+                if await close_btns.count() > 0:
+                    await close_btns.first.click(timeout=3000)
+                    await page.wait_for_timeout(1000)
+            except:
+                pass # 閉じるボタンがなければ無視
+
+            # 診断チェック1：最初のボタンを押す前の状態を記録
+            diag_1 = await analyze_page(page, "アクセス直後")
+
+            # 手順1: 1回目の「データダウンロード」ボタンをクリック
+            try:
+                # 曖昧検索で確実に文字を捉え、強制クリック（上に透明なバナーがあっても貫通する）
+                dl_button_1 = page.get_by_text("データダウンロード").first
+                await dl_button_1.scroll_into_view_if_needed(timeout=10000)
+                await dl_button_1.click(force=True, timeout=10000)
+            except Exception as e:
+                # エラー時は「何が見えていたか」の診断結果を添えてLINEに送る
+                send_line_message(f"【エラー】1回目のボタンが押せませんでした。\n\n{diag_1}\n\n詳細: {e}")
+                await browser.close()
+                return
+
+            await page.wait_for_timeout(2000) # モーダルのアニメーションを待つ
             
-            # 手順1: 1回目の「データダウンロード」ボタン（メイン画面のボタン）
-            # クラス名やリンク構造で明確に指定します
-            first_dl_button = page.locator('a.btn-download, a:has-text("データダウンロード")').first
-            await first_dl_button.scroll_into_view_if_needed()
-            await first_dl_button.click(force=True)
-            
-            # モーダル（ポップアップ画面）が開くのを確実に待つ
-            await page.wait_for_timeout(2000) 
-            
-            # 手順2: モーダル内にある2回目の「データダウンロード」ボタン
-            # モーダル領域（.modal, .dialog など）の中にあるボタンを狙うのが確実ですが、
-            # サイト構造が不明確な場合を考慮し、「画面上に表示されている（visible）」ボタンを狙う
-            second_dl_button = page.locator('button:has-text("データダウンロード"):visible, a:has-text("データダウンロード"):visible').last
-            
-            async with page.expect_download(timeout=60000) as download_info:
-                await second_dl_button.click(force=True)
+            # 診断チェック2：モーダルが出た後の状態を記録
+            diag_2 = await analyze_page(page, "モーダル展開後")
+
+            # 手順2: 2回目のボタンを押してダウンロード
+            try:
+                # 画面上に複数ある「データダウンロード」のうち、一番最後（手前に出たモーダル内）を狙う
+                dl_button_2 = page.get_by_text("データダウンロード").last
                 
-            download = await download_info.value
-            file_path = await download.path()
+                async with page.expect_download(timeout=45000) as download_info:
+                    await dl_button_2.click(force=True, timeout=10000)
+                    
+                download = await download_info.value
+                file_path = await download.path()
+            except Exception as e:
+                send_line_message(f"【エラー】2回目のボタン(CSV保存)が押せませんでした。\n\n{diag_2}\n\n詳細: {e}")
+                await browser.close()
+                return
+                
             await browser.close()
+            send_line_message("【報告】CSVデータのダウンロードに成功しました！解析に移行します。")
             
     except Exception as e:
-        send_line_message(f"【エラー】サイトからのデータダウンロードに失敗しました。\n詳細: {e}")
+        send_line_message(f"【致命的エラー】Playwrightの操作中に予期せぬエラーが発生しました。\n詳細: {e}")
         return
 
     # --- CSV解析 ---
