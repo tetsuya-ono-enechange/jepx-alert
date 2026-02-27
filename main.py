@@ -18,71 +18,86 @@ def send_line_message(text):
     requests.post(url, headers=headers, json=payload)
 
 async def main_logic():
-    send_line_message("【最終調整】\n本物のCSVファイル（30分コマデータ）を厳密に指定して取得します...")
+    send_line_message("【総当たり探索モード】\n本物のスポット市場データを探し出します...")
     
     now = datetime.now()
     tomorrow = now + timedelta(days=1)
-    saved_file_path = "jepx_spot.csv"
+    correct_csv_path = None
     
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
             page = await browser.new_page(viewport={"width": 1920, "height": 1080})
-            page.set_default_timeout(45000)
+            page.set_default_timeout(30000)
             
             await page.goto("https://www.jepx.jp/electricpower/market-data/spot/")
             await page.wait_for_load_state("networkidle")
-            await page.wait_for_timeout(5000)
+            await page.wait_for_timeout(3000)
 
-            # 【★最大の修正点】「インデックス」ボタンを除外するため、exact=True（完全一致）で指定
-            target_buttons = page.get_by_text("データダウンロード", exact=True)
-
-            # 手順1: 1回目のボタン強制クリック
+            # --- カレンダーの必須操作（これをしないと本物のデータが落ちてこない仕様に対応） ---
             try:
-                await target_buttons.first.evaluate("node => node.click()")
+                # 日付入力欄をクリックしてカレンダーを開く
+                cal_input = page.locator('input[placeholder*="日付"], .flatpickr-input').first
+                await cal_input.click(timeout=5000)
+                await page.wait_for_timeout(1000)
+                # 選択可能な日付（今日など）をクリック
+                day_cell = page.locator('.flatpickr-day:not(.prevMonthDay):not(.nextMonthDay)').last
+                await day_cell.click(timeout=5000)
+                await page.wait_for_timeout(1000)
             except Exception as e:
-                send_line_message(f"【エラー】1回目のボタンが押せませんでした。\n詳細: {e}")
-                await browser.close()
-                return
+                pass # カレンダー操作ができなくても続行
 
-            await page.wait_for_timeout(2000)
-
-            # 手順2: 2回目のボタン強制クリックと保存
-            try:
-                async with page.expect_download(timeout=45000) as download_info:
-                    await target_buttons.last.evaluate("node => node.click()")
+            # --- 総当たりダウンロード作戦 ---
+            # 「ダウンロード」という文字が含まれるボタンやリンクをすべて取得
+            buttons = page.locator('button:has-text("ダウンロード"), a:has-text("ダウンロード")')
+            count = await buttons.count()
+            
+            for i in range(count):
+                button = buttons.nth(i)
+                try:
+                    # ボタンをクリックしてダウンロードを待機
+                    async with page.expect_download(timeout=15000) as dl_info:
+                        await button.evaluate("node => node.click()")
+                        
+                    download = await dl_info.value
+                    temp_path = f"jepx_candidate_{i}.csv"
+                    await download.save_as(temp_path)
                     
-                download = await download_info.value
-                await download.save_as(saved_file_path)
-                
-            except Exception as e:
-                send_line_message(f"【エラー】2回目のボタン(CSV保存)が押せませんでした。\n詳細: {e}")
-                await browser.close()
-                return
-                
+                    # ダウンロードしたCSVの中身を確認
+                    try:
+                        df_temp = pd.read_csv(temp_path, encoding="shift_jis")
+                        cols = df_temp.columns.tolist()
+                        # スポットデータ特有の列「東京」が含まれているか判定
+                        if any("東京" in col for col in cols):
+                            correct_csv_path = temp_path
+                            break # 正解が見つかったら探索を終了！
+                    except Exception as parse_e:
+                        continue # CSVじゃなければ次へ
+                        
+                except Exception as e:
+                    continue # ダウンロードが始まらなければ次へ
+                    
             await browser.close()
             
     except Exception as e:
-        send_line_message(f"【致命的エラー】Playwrightの操作中にエラーが発生しました。\n詳細: {e}")
+        send_line_message(f"【システムエラー】ブラウザ操作中にエラーが発生しました。\n詳細: {e}")
         return
 
-    # --- CSV解析 ---
+    # 正解のファイルが見つからなかった場合
+    if not correct_csv_path:
+        send_line_message("【エラー】画面上のすべてのボタンを試しましたが、本物のスポット市場データ（東京）が見つかりませんでした。")
+        return
+
+    send_line_message("【解析フェーズ】\n本物のCSVデータの取得に成功しました！解析を行います...")
+
+    # --- CSV解析（正解のファイルを使用） ---
     try:
-        df = pd.read_csv(saved_file_path, encoding="shift_jis")
-        
+        df = pd.read_csv(correct_csv_path, encoding="shift_jis")
         columns = df.columns.tolist()
-        target_area = None
         
-        for col in columns:
-            if "東京" in col and "プライス" in col:
-                target_area = col
-                break
-                
-        if target_area is None:
-            cols_str = "\n".join(columns[:15])
-            send_line_message(f"【列名エラー】\nCSV内に「東京」の列が見つかりません。\n\n▼実際の列名一覧▼\n{cols_str}")
-            return
-            
+        # 「東京」と「プライス」が含まれる列を正確に特定
+        target_area = next((col for col in columns if "東京" in col and "プライス" in col), None)
+        
         df = df.dropna(subset=["受渡日", target_area])
         
         tomorrow_str_padded = tomorrow.strftime("%Y/%m/%d")
@@ -98,7 +113,7 @@ async def main_logic():
             target_date_str = "今日"
             
             if df_target.empty:
-                send_line_message("【エラー】解析可能なデータ（今日・明日）が見つかりませんでした。")
+                send_line_message("【エラー】CSV内に今日・明日のデータがまだ反映されていません。")
                 return
 
         cheap_slots = df_target[df_target[target_area] <= PRICE_LIMIT]
