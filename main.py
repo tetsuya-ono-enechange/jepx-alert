@@ -1,14 +1,15 @@
 import os
 import requests
 import pandas as pd
-import io
-import traceback
 from datetime import datetime, timedelta
+from playwright.sync_api import sync_playwright
 
+# --- 設定項目 ---
 LINE_TOKEN = os.environ.get("LINE_TOKEN")
 USER_ID = os.environ.get("LINE_USER_ID")
 TARGET_AREA = "エリアプライス東京(円/kWh)"
 PRICE_LIMIT = 15.0
+# --------------
 
 def send_line_message(text):
     url = "https://api.line.me/v2/bot/message/push"
@@ -17,49 +18,67 @@ def send_line_message(text):
     requests.post(url, headers=headers, json=payload)
 
 def main():
-    # 1. 起動したことを即座にLINEへ通知
-    send_line_message("【デバッグ実行】\nプログラムが起動しました。JEPXデータを取得します...")
+    # ★ ご要望の仕様：実行直後に必ず第一報のアラートを飛ばす ★
+    send_line_message("【開始通知】\nJEPX価格チェッカーが起動しました。\n現在、最新のデータを取得・解析中です...")
+    
+    now = datetime.now()
+    tomorrow = now + timedelta(days=1)
+    file_path = ""
     
     try:
-        now = datetime.now()
-        tomorrow = now + timedelta(days=1)
-        fiscal_year = tomorrow.year if tomorrow.month >= 4 else tomorrow.year - 1
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            
+            page.goto("https://www.jepx.jp/electricpower/market-data/spot/")
+            page.wait_for_load_state("networkidle")
+            
+            # ※Qiita記事の知見より、カレンダー操作は過剰と判明したため全削除（高速化）
+            
+            # 手順1: 1回目の「データダウンロード」ボタンを押し、モーダルを出す
+            dl_buttons = page.locator('text="データダウンロード"')
+            dl_buttons.first.click(force=True)
+            page.wait_for_timeout(1500) # モーダルが開くのを待つ
+            
+            # 手順2: モーダル内にある2回目のボタンを押してCSVを受け取る
+            with page.expect_download(timeout=60000) as download_info:
+                dl_buttons.last.click(force=True)
+                
+            file_path = download_info.value.path()
+            browser.close()
+            
+    except Exception as e:
+        send_line_message(f"【エラー】サイトからのデータダウンロードに失敗しました。\n詳細: {e}")
+        return
+
+    # --- CSV解析（Qiita記事に沿ったデータ整形と抽出） ---
+    try:
+        df = pd.read_csv(file_path, encoding="shift_jis")
         
-        csv_url = f"https://www.jepx.jp/electricpower/market-data/spot/csv/spot_{fiscal_year}.csv"
-        headers = {"User-Agent": "Mozilla/5.0"}
-        response = requests.get(csv_url, headers=headers)
-        
-        if response.status_code != 200:
-            send_line_message(f"【エラー】CSVの取得に失敗しました。(Status: {response.status_code})")
+        # エリア名の列が存在するかチェック
+        if TARGET_AREA not in df.columns:
+            send_line_message(f"【エラー】エリア名「{TARGET_AREA}」がCSV内に見つかりません。")
             return
             
-        df = pd.read_csv(io.BytesIO(response.content), encoding="shift_jis")
+        # 【データ整形】価格や日付が空欄（NaN）の不正な行を事前に除外
+        df = df.dropna(subset=["受渡日", TARGET_AREA])
         
-        # ターゲットエリアのカラムが存在するか確認
-        if TARGET_AREA not in df.columns:
-            send_line_message(f"【エラー】エリア名「{TARGET_AREA}」がCSV内に見つかりません。\n設定を確認してください。")
-            return
-
-        # 最新の日付を特定
-        latest_date = df["受渡日"].iloc[-1]
-        
+        # 日付フォーマットの揺れに対応
         tomorrow_str_padded = tomorrow.strftime("%Y/%m/%d")
         tomorrow_str_unpadded = f"{tomorrow.year}/{tomorrow.month}/{tomorrow.day}"
         
         df_target = df[(df["受渡日"] == tomorrow_str_padded) | (df["受渡日"] == tomorrow_str_unpadded)]
         target_date_str = "明日"
         
-        # もし明日のデータがなければ、今日のデータで代用する
+        # 明日のデータがない場合は「今日」のデータで代替
         if df_target.empty:
-            send_line_message(f"【報告】明日のデータがまだ公開されていません。\n(CSV内の最新日付: {latest_date})\n\n代わりに『今日』のデータで判定を行います。")
-            
             today_str_padded = now.strftime("%Y/%m/%d")
             today_str_unpadded = f"{now.year}/{now.month}/{now.day}"
             df_target = df[(df["受渡日"] == today_str_padded) | (df["受渡日"] == today_str_unpadded)]
             target_date_str = "今日"
             
             if df_target.empty:
-                send_line_message("【エラー】今日のデータも見つかりませんでした。処理を終了します。")
+                send_line_message("【エラー】解析可能なデータ（今日・明日）が見つかりませんでした。")
                 return
 
         # 15円以下の時間帯を抽出
@@ -68,22 +87,22 @@ def main():
         if cheap_slots.empty:
             send_line_message(f"【結果報告】\n{target_date_str}は{PRICE_LIMIT}円以下の時間がありませんでした。\n(充電見送り推奨)")
         else:
+            # 【データ抽出】時刻コード（1-48）を実時間に変換（Qiita記事準拠）
             min_row = cheap_slots.loc[cheap_slots[TARGET_AREA].idxmin()]
             time_code = int(min_row['時刻コード'])
             hour = (time_code - 1) // 2
             minute = "30" if time_code % 2 == 0 else "00"
             
-            msg = (
+            message = (
                 f"【{target_date_str}の充電推奨】\n"
                 f"最安値: {min_row[TARGET_AREA]}円\n"
                 f"時間帯: {hour:02d}:{minute}〜\n"
                 f"※15円以下は計 {len(cheap_slots)} コマ"
             )
-            send_line_message(msg)
-
+            send_line_message(message)
+            
     except Exception as e:
-        # 万が一プログラムがエラーで落ちた場合も、原因をLINEに送る
-        send_line_message(f"【システムエラー発生】\nプログラム内でエラーが起きました:\n{e}")
+        send_line_message(f"【エラー】CSV解析中にエラーが発生しました。\n詳細: {e}")
 
 if __name__ == "__main__":
     main()
