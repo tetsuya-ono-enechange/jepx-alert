@@ -1,24 +1,26 @@
 import os
 import requests
 import pandas as pd
+import asyncio
 from datetime import datetime, timedelta
-from playwright.sync_api import sync_playwright
+from playwright.async_api import async_playwright
 
 # --- 設定項目 ---
 LINE_TOKEN = os.environ.get("LINE_TOKEN")
 USER_ID = os.environ.get("LINE_USER_ID")
-TARGET_AREA = "エリアプライス東京(円/kWh)"
+TARGET_AREA = "エリアプライス東京(円/kWh)" # お住まいのエリア
 PRICE_LIMIT = 15.0
 # --------------
 
 def send_line_message(text):
+    """LINEへメッセージを送信する関数（ここはそのまま）"""
     url = "https://api.line.me/v2/bot/message/push"
     headers = {"Authorization": f"Bearer {LINE_TOKEN}"}
     payload = {"to": USER_ID, "messages": [{"type": "text", "text": text}]}
     requests.post(url, headers=headers, json=payload)
 
-def main():
-    # ★ ご要望の仕様：実行直後に必ず第一報のアラートを飛ばす ★
+async def main_logic():
+    """データ取得から解析までのメイン処理（非同期モード）"""
     send_line_message("【開始通知】\nJEPX価格チェッカーが起動しました。\n現在、最新のデータを取得・解析中です...")
     
     now = datetime.now()
@@ -26,32 +28,32 @@ def main():
     file_path = ""
     
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page()
+        # 非同期モード(async_playwright)でブラウザを起動
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page()
             
-            page.goto("https://www.jepx.jp/electricpower/market-data/spot/")
-            page.wait_for_load_state("networkidle")
-            
-            # ※Qiita記事の知見より、カレンダー操作は過剰と判明したため全削除（高速化）
+            await page.goto("https://www.jepx.jp/electricpower/market-data/spot/")
+            await page.wait_for_load_state("networkidle")
             
             # 手順1: 1回目の「データダウンロード」ボタンを押し、モーダルを出す
             dl_buttons = page.locator('text="データダウンロード"')
-            dl_buttons.first.click(force=True)
-            page.wait_for_timeout(1500) # モーダルが開くのを待つ
+            await dl_buttons.first.click(force=True)
+            await page.wait_for_timeout(1500) # モーダルが開くのを待つ
             
             # 手順2: モーダル内にある2回目のボタンを押してCSVを受け取る
-            with page.expect_download(timeout=60000) as download_info:
-                dl_buttons.last.click(force=True)
+            async with page.expect_download(timeout=60000) as download_info:
+                await dl_buttons.last.click(force=True)
                 
-            file_path = download_info.value.path()
-            browser.close()
+            download = await download_info.value
+            file_path = await download.path()
+            await browser.close()
             
     except Exception as e:
         send_line_message(f"【エラー】サイトからのデータダウンロードに失敗しました。\n詳細: {e}")
         return
 
-    # --- CSV解析（Qiita記事に沿ったデータ整形と抽出） ---
+    # --- CSV解析（ここは通常のPython処理） ---
     try:
         df = pd.read_csv(file_path, encoding="shift_jis")
         
@@ -87,7 +89,7 @@ def main():
         if cheap_slots.empty:
             send_line_message(f"【結果報告】\n{target_date_str}は{PRICE_LIMIT}円以下の時間がありませんでした。\n(充電見送り推奨)")
         else:
-            # 【データ抽出】時刻コード（1-48）を実時間に変換（Qiita記事準拠）
+            # 最安値を取得し、時刻コードを実時間に変換
             min_row = cheap_slots.loc[cheap_slots[TARGET_AREA].idxmin()]
             time_code = int(min_row['時刻コード'])
             hour = (time_code - 1) // 2
@@ -105,4 +107,5 @@ def main():
         send_line_message(f"【エラー】CSV解析中にエラーが発生しました。\n詳細: {e}")
 
 if __name__ == "__main__":
-    main()
+    # イベントループの衝突を避けるための実行コマンド
+    asyncio.run(main_logic())
